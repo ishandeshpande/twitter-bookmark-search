@@ -7,12 +7,14 @@
     "storage",
     "webRequest",
     "activeTab",
-    "scripting",
-    "clipboardWrite"
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
+  "externally_connectable": {
+    "matches": ["http://localhost:5173/*", "https://localhost:5173/*", "https://elondontsueme.com/*"]
+  },
   "action": {
   },
   "background": {

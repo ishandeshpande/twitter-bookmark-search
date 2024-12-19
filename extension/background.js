@@ -1,146 +1,220 @@
+let isDone = false;
+let not2024count = 0;
+const SITE_URL = "localhost:5173";
+
 chrome.action.onClicked.addListener((tab) => {
   chrome.tabs.create({
     url: 'popup.html'
   });
 });
 
+chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
+  if (message.type === 'EXTENSION_READY') {
+    console.log("Received EXTENSION_READY message from landing page");
+    sendResponse({ status: "ready" });
+  } else if (message.type === 'GET_TWITTER_DATA') {
+    console.log(`Received ${message.type} message from landing page`);
+    
+    // Reset global state
+    isDone = false;
+    not2024count = 0;
+
+    // Create single bookmarks tab
+    chrome.tabs.create({ url: "https://x.com/i/bookmarks/all" }, async (newTab) => {
+      // Store tab ID for later use
+      const bookmarksTabId = newTab.id;
+
+      // Show loader
+      setTimeout(() => {
+        chrome.tabs.sendMessage(bookmarksTabId, {action: "showLoader"});
+      }, 1000);
+
+      try {
+        // Wait for required data and fetch bookmarks
+        await waitForRequiredData();
+        let allTweets = [];
+        await getBookmarks("", 0, allTweets);
+        
+        // Process the data
+        const processedData = processBookmarksData(allTweets);
+
+        // Close the bookmarks tab
+        // chrome.tabs.remove(bookmarksTabId);
+
+        chrome.tabs.query({}, (tabs) => {
+          console.log("Tabs", tabs);
+          for (const tab of tabs) {
+            if (tab.url.includes(SITE_URL)) {
+              chrome.tabs.update(tab.id, {active: true});
+            }
+          }
+        });
+
+        // Send response back to landing page
+        sendResponse({ 
+          status: "ready",
+          bookmarks: allTweets,
+          stats: processedData
+        });
+      } catch (error) {
+        console.error("Error processing bookmarks:", error);
+        chrome.tabs.remove(bookmarksTabId);
+        sendResponse({ status: "error", message: error.message });
+      }
+    });
+  } else {
+    return false;
+  }
+});
+
 const getTweetYear = (timestamp) => {
   return new Date(timestamp).getFullYear();
 };
 
-let isDone = false;
-let not2024count = 0;
+
+
+const processBookmarksData = (tweets) => {
+  // Calculate total bookmarks
+  const totalBookmarks = tweets.length;
+
+  // Process authors
+  const authorStats = {};
+  tweets.forEach(tweet => {
+    const author = tweet.author;
+    if (!authorStats[author.screen_name]) {
+      authorStats[author.screen_name] = {
+        count: 0,
+        name: author.name,
+        screen_name: author.screen_name,
+        profile_image_url: author.profile_image_url
+      };
+    }
+    authorStats[author.screen_name].count++;
+  });
+
+  const topAuthors = Object.values(authorStats)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // Calculate reading time
+  const WORDS_PER_MINUTE = 238;
+  const totalWords = tweets.reduce((sum, tweet) => {
+    const words = tweet.full_text ? tweet.full_text.split(/\s+/).length : 0;
+    return sum + words;
+  }, 0);
+  const readingTime = Math.round(totalWords / WORDS_PER_MINUTE);
+
+  // Calculate monthly stats
+  const monthCounts = {};
+  const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  
+  tweets.forEach(tweet => {
+    const date = new Date(tweet.timestamp);
+    const monthKey = monthNames[date.getMonth()];
+    monthCounts[monthKey] = (monthCounts[monthKey] || 0) + 1;
+  });
+  
+  const topMonth = Object.entries(monthCounts)
+    .sort(([,a], [,b]) => b - a)[0];
+
+  return {
+    totalBookmarks,
+    topAuthors,
+    readingTime,
+    topMonth: topMonth[0],
+    monthCount: topMonth[1]
+  };
+};
 
 const getBookmarks = async (cursor = "", totalImported = 0, allTweets = []) => {
-  chrome.storage.local.get(
-    ["cookie", "csrf", "auth"],
-    async (sessionResult) => {
-      if (
-        !sessionResult.cookie ||
-        !sessionResult.csrf ||
-        !sessionResult.auth
-      ) {
-        console.error("cookie, csrf, or auth is missing");
-        return;
-      } 
+  const sessionData = await chrome.storage.local.get(["cookie", "csrf", "auth"]);
+  const localData = await chrome.storage.local.get(["bookmarksApiId", "features"]);
 
-      chrome.storage.local.get(["bookmarksApiId", "features"], async (localResult) => {
-        if (!localResult.bookmarksApiId || !localResult.features) {
-          return;
-        }
+  if (!sessionData.cookie || !sessionData.csrf || !sessionData.auth) {
+    throw new Error("Missing authentication data");
+  }
 
-        const headers = new Headers();
-        headers.append("Cookie", sessionResult.cookie);
-        headers.append("X-Csrf-token", sessionResult.csrf);
-        headers.append("Authorization", sessionResult.auth);
+  if (!localData.bookmarksApiId || !localData.features) {
+    throw new Error("Missing API configuration");
+  }
 
-        const variables = {
-          count: 100,
-          cursor: cursor,
-          includePromotedContent: false,
-        };
-        const API_URL = `https://x.com/i/api/graphql/${
-          localResult.bookmarksApiId
-        }/Bookmarks?features=${encodeURIComponent(
-          JSON.stringify(localResult.features)
-        )}&variables=${encodeURIComponent(JSON.stringify(variables))}`;
+  const headers = new Headers();
+  headers.append("Cookie", sessionData.cookie);
+  headers.append("X-Csrf-token", sessionData.csrf);
+  headers.append("Authorization", sessionData.auth);
 
-        console.log("API_URL", API_URL);
+  const variables = {
+    count: 100,
+    cursor: cursor,
+    includePromotedContent: false,
+  };
+  const API_URL = `https://x.com/i/api/graphql/${
+    localData.bookmarksApiId
+  }/Bookmarks?features=${encodeURIComponent(
+    JSON.stringify(localData.features)
+  )}&variables=${encodeURIComponent(JSON.stringify(variables))}`;
 
-        try {
-          const response = await fetch(API_URL, {
-            method: "GET",
-            headers: headers,
-            redirect: "follow",
-          });
+  console.log("API_URL", API_URL);
 
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
+  try {
+    const response = await fetch(API_URL, {
+      method: "GET",
+      headers: headers,
+      redirect: "follow",
+    });
 
-          const data = await response.json();
-          const entries =
-            data.data?.bookmark_timeline_v2?.timeline?.instructions?.[0]
-              ?.entries || [];
-          
-          const tweetEntries = entries.filter((entry) =>
-            entry.entryId.startsWith("tweet-")
-          );
-
-          const parsedTweets = tweetEntries.map(parseTweet);
-          console.log("Parsed Tweets", parsedTweets);
-          for (const tweet of parsedTweets) {
-            if (getTweetYear(tweet.timestamp) !== 2024) {
-              console.log("Year is not 2024, stopping import");
-              not2024count++;
-              if (not2024count > 10) {
-                isDone = true;
-                break;
-              }
-            }
-            else {
-              not2024count = 0;
-              allTweets.push(tweet);
-            }
-          }
-          
-          const newTweetsCount = parsedTweets.length;
-          totalImported += newTweetsCount;
-
-          console.log("Bookmarks data:", data);
-          console.log("New tweets in this batch:", newTweetsCount);
-          console.log("Current total imported:", totalImported);
-
-          const nextCursor = getNextCursor(entries);
-
-          if (nextCursor && newTweetsCount > 0 && !isDone) {
-            await getBookmarks(nextCursor, totalImported, allTweets);
-          } else {
-            console.log("Import completed. Total imported:", totalImported);
-            console.log("All imported tweets:", allTweets);
-            
-            chrome.tabs.query({}, function(tabs) {
-              tabs.forEach(tab => {
-                if (tab.url && (tab.url.includes('x.com/i/bookmarks') || tab.url.includes('twitter.com/i/bookmarks'))) {
-                  chrome.tabs.sendMessage(tab.id, { action: "hideLoader" });
-                }
-              });
-            });
-            
-            chrome.runtime.sendMessage({
-              action: "tweetsReady",
-              tweets: allTweets
-            });
-            
-            chrome.tabs.query({}, function(tabs) {
-              const popupTabs = tabs.filter(tab => 
-                !tab.url && !tab.title
-              );
-
-              const popupTab = popupTabs[popupTabs.length - 1];
-
-              console.log("Popup tab: ", popupTab);
-              
-              if (popupTab) {
-                chrome.tabs.update(popupTab.id, { active: true });
-                chrome.windows.update(popupTab.windowId, { focused: true });
-              }
-            });
-          }
-        } catch (error) {
-          console.error("Error fetching bookmarks:", error);
-          chrome.tabs.query({}, function(tabs) {
-            tabs.forEach(tab => {
-              if (tab.url && (tab.url.includes('x.com/i/bookmarks') || tab.url.includes('twitter.com/i/bookmarks'))) {
-                chrome.tabs.sendMessage(tab.id, { action: "hideLoader" });
-              }
-            });
-          });
-        }
-      });
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
     }
-  );
-}
+
+    const data = await response.json();
+    const entries =
+      data.data?.bookmark_timeline_v2?.timeline?.instructions?.[0]
+        ?.entries || [];
+    
+    const tweetEntries = entries.filter((entry) =>
+      entry.entryId.startsWith("tweet-")
+    );
+
+    const parsedTweets = tweetEntries.map(parseTweet);
+    console.log("Parsed Tweets", parsedTweets);
+    for (const tweet of parsedTweets) {
+      if (getTweetYear(tweet.timestamp) !== 2024) {
+        console.log("Year is not 2024, stopping import");
+        not2024count++;
+        if (not2024count > 10) {
+          isDone = true;
+          break;
+        }
+      }
+      else {
+        not2024count = 0;
+        allTweets.push(tweet);
+      }
+    }
+    
+    const newTweetsCount = parsedTweets.length;
+    totalImported += newTweetsCount;
+
+    console.log("Bookmarks data:", data);
+    console.log("New tweets in this batch:", newTweetsCount);
+    console.log("Current total imported:", totalImported);
+
+    const nextCursor = getNextCursor(entries);
+
+    if (nextCursor && newTweetsCount > 0 && !isDone) {
+      await getBookmarks(nextCursor, totalImported, allTweets);
+    } else {
+      console.log("Import completed. Total imported:", totalImported);
+      console.log("All imported tweets:", allTweets);
+      
+      // Process the data
+      const processedData = processBookmarksData(allTweets);
+    }
+  } catch (error) {
+    console.error("Error fetching bookmarks:", error);
+  }
+};
 
 const parseTweet = (entry) => {
   const tweet = entry.content?.itemContent?.tweet_results?.result?.tweet || entry.content?.itemContent?.tweet_results?.result;
